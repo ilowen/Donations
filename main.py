@@ -2,12 +2,13 @@ import os
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from yoomoney import Client
+from pydantic import BaseModel
+from yoomoney import Client, Quickpay
 import uvicorn
 
 app = FastAPI()
 
-# Включаем CORS, чтобы HTML-виджет из OBS мог без ошибок забирать донаты
+# Включаем CORS, чтобы фронтенд мог слать fetch-запросы на бэкенд без блокировок
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,11 +17,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🔐 БЕЗОПАСНЫЕ НАСТРОЙКИ ИЗ ENV-ПЕРЕМЕННЫХ RENDER
+# 🔐 Читаем кошелек и токен из переменных окружения хостинга Render
+# (В репозитории данные не светятся)
 YOOMONEY_WALLET = os.environ.get("YOOMONEY_WALLET", "КОШЕЛЕК_НЕ_НАСТРОЕН")
 YOOMONEY_TOKEN = os.environ.get("YOOMONEY_TOKEN")
 
-# Инициализируем клиента ЮMoney для проверки истории
+# Инициализируем клиент истории ЮMoney
 if YOOMONEY_TOKEN:
     try:
         yoomoney_client = Client(YOOMONEY_TOKEN)
@@ -29,80 +31,135 @@ if YOOMONEY_TOKEN:
         print(f"❌ Ошибка токена ЮMoney: {e}")
         yoomoney_client = None
 else:
-    print("⚠️ Переменная YOOMONEY_TOKEN не найдена. Сообщения вытягиваться не будут.")
+    print("⚠️ Переменная YOOMONEY_TOKEN не найдена.")
     yoomoney_client = None
 
-# Очередь донатов в оперативной памяти сервера для OBS
+# Очередь донатов в оперативной памяти сервера для OBS виджета
 DONATIONS_QUEUE = []
 
+# Модель данных, которую мы ждем от UI через fetch
+class DonationOrder(BaseModel):
+    username: str
+    message: str
+    amount: int
+
 # =====================================================================
-# 1. ГЛАВНАЯ СТРАНИЦА ОПЛАТЫ (GET /) - Динамическая форма
+# 1. ИНТЕРФЕЙС (GET /) - Красивый UI с fetch-запросом
 # =====================================================================
 @app.get("/", response_class=HTMLResponse)
 async def home_page():
-    return f"""
+    return """
     <html>
         <head>
             <meta charset="UTF-8">
-            <title>YooMoney Alpha Donat</title>
+            <title>YooMoney True Alpha Donat</title>
             <style>
-                body {{ font-family: Arial, sans-serif; max-width: 400px; margin: 50px auto; padding: 20px; background: #f4f4f9; text-align: center; }}
-                .card {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-                input, textarea, button {{ width: 100%; padding: 12px; margin: 8px 0; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }}
-                button {{ background: #8a2be2; color: white; font-weight: bold; cursor: pointer; border: none; font-size: 16px; }}
-                button:hover {{ background: #6a1b9a; }}
-                textarea {{ resize: none; height: 80px; }}
-                h2 {{ color: #333; }}
+                body { font-family: Arial, sans-serif; max-width: 400px; margin: 50px auto; padding: 20px; background: #f4f4f9; text-align: center; }
+                .card { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+                input, textarea, button { width: 100%; padding: 12px; margin: 8px 0; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }
+                button { background: #8a2be2; color: white; font-weight: bold; cursor: pointer; border: none; font-size: 16px; }
+                button:hover { background: #6a1b9a; }
+                textarea { resize: none; height: 80px; }
+                h2 { color: #333; }
+                .error { color: red; font-size: 13px; margin-top: 5px; display: none; }
             </style>
         </head>
         <body>
             <div class="card">
                 <h2>Отправить донат</h2>
                 
-                <!-- Официальный шлюз Quickpay. Браузер сам перейдет на сайт оплаты -->
-                <form action="https://yoomoney.ru" method="POST" onsubmit="prepareDonation(event, this)">
-                    
-                    <input type="hidden" name="receiver" value="{YOOMONEY_WALLET}">
-                    <input type="hidden" name="quickpay-form" value="button">
-                    <input type="hidden" name="targets" value="Поддержка стрима">
-                    <input type="hidden" name="paymentType" value="AC">
-                    
-                    <!-- Скрытое поле label, куда упакуем ник и сообщение -->
-                    <input type="hidden" name="label" id="yoomoney-label">
-
+                <!-- Форма БЕЗ атрибутов action и method, управляется чисто через JS -->
+                <form id="donationForm" onsubmit="sendDonationRequest(event)">
                     <input type="text" id="username" placeholder="Ваш никнейм" required maxlength="15">
                     <textarea id="message" placeholder="Текст сообщения..." maxlength="40"></textarea>
-                    <input type="number" name="sum" placeholder="Сумма (руб)" min="2" value="100" required>
+                    <input type="number" id="amount" placeholder="Сумма (руб)" min="2" value="100" required>
                     
-                    <button type="submit">Поддержать</button>
+                    <button type="submit" id="submitBtn">Поддержать</button>
+                    <div id="errorMsg" class="error">Ошибка сервера. Попробуйте позже.</div>
                 </form>
                 <p style="color: gray; font-size: 11px; margin-top: 15px;">Донат-сервер: СТАТУС АКТИВЕН 🟢</p>
             </div>
 
             <script>
-                function prepareDonation(event, form) {{
-                    const nick = document.getElementById('username').value.trim() || 'Аноним';
-                    const msg = document.getElementById('message').value.trim() || 'Без сообщения';
+                async function sendDonationRequest(event) {
+                    event.preventDefault(); // Стопаем стандартную отправку страницы
                     
-                    // Обрезаем, чтобы гарантированно влезть в лимит label от ЮMoney (64 символа)
-                    const cleanNick = nick.substring(0, 15);
-                    const cleanMsg = msg.substring(0, 40);
+                    const submitBtn = document.getElementById('submitBtn');
+                    const errorMsg = document.getElementById('errorMsg');
                     
-                    document.getElementById('yoomoney-label').value = cleanNick + "|||" + cleanMsg;
-                }}
+                    submitBtn.innerText = "Создание заказа...";
+                    submitBtn.disabled = true;
+                    errorMsg.style.display = "none";
+
+                    // 1. Собираем данные из полей UI
+                    const payload = {
+                        username: document.getElementById('username').value.trim() || 'Аноним',
+                        message: document.getElementById('message').value.trim() || 'Без сообщения',
+                        amount: parseInt(document.getElementById('amount').value) || 100
+                    };
+
+                    try {
+                        // 2. Пуляем асинхронный POST-запрос на ТВОЙ бэкенд /create-order
+                        const response = await fetch('/create-order', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+
+                        if (!response.ok) throw new Error("Server error");
+
+                        // 3. Получаем сгенерированную бэкендом ссылку ЮMoney
+                        const data = await response.json();
+                        
+                        // 4. Мягко перенаправляем зрителя на шлюз оплаты ЮMoney
+                        if (data.url) {
+                            window.location.href = data.url;
+                        } else {
+                            throw new Error("No URL returned");
+                        }
+                    } catch (err) {
+                        console.error(err);
+                        submitBtn.innerText = "Поддержать";
+                        submitBtn.disabled = false;
+                        errorMsg.style.display = "block";
+                    }
+                }
             </script>
         </body>
     </html>
     """
 
 # =====================================================================
-# 2. ЛОВУШКА ХУКОВ + ФИЛЬТР ИСТОРИИ ХАБРА (POST /webhook)
+# 2. БЭКЕНД-РОУТ: ПРИЕМ ЗАПРОСА И СОЗДАНИЕ ССЫЛКИ (POST /create-order)
+# =====================================================================
+@app.post("/create-order")
+async def create_order(order: DonationOrder):
+    # Чистим и обрезаем строки под лимиты label (64 символа)
+    clean_nick = order.username[:15]
+    clean_msg = order.message[:40]
+    
+    # Склеиваем ник и сообщение в одну строчку для label
+    raw_label = f"{clean_nick}|||{clean_msg}"
+    
+    # Вызываем Quickpay из пакета yoomoney, он сам соберет легитимную ссылку
+    quickpay = Quickpay(
+        receiver=YOOMONEY_WALLET,
+        quickpay_form="shop",
+        targets="Поддержка стрима",
+        paymentType="AC",  # Карты и SberPay
+        sum=order.amount,
+        label=raw_label
+    )
+    
+    # Возвращаем готовую ссылку ЮMoney обратно в UI в формате JSON
+    return JSONResponse(content={"url": quickpay.base_url})
+
+# =====================================================================
+# 3. ЛОВУШКА ХУКОВ + ФИЛЬТР ИСТОРИИ (POST /webhook)
 # =====================================================================
 @app.post("/webhook")
 async def handle_yoomoney_webhook(request: Request):
     form_data = await request.form()
-    
-    # ЮMoney присылает вебхук. Достаем label, который мы сгенерировали
     incoming_label = form_data.get("label")
     
     if not incoming_label:
@@ -112,35 +169,29 @@ async def handle_yoomoney_webhook(request: Request):
     message = "Без сообщения"
     amount = form_data.get("withdraw_amount", "0")
 
-    # 🔥 ФИШКА ИЗ СТАТЬИ НА ХАБРЕ: Используем историю API для вытягивания точных данных
     if yoomoney_client:
         try:
-            # Запрашиваем историю операций конкретно по этому label
+            # Вытягиваем через API историю конкретно по этому label
             history = yoomoney_client.operation_history(label=incoming_label)
-            
             if history and history.operations:
-                # Берем подтвержденную операцию из истории кошелька
                 operation = history.operations[0]
-                amount = operation.amount  # Берем чистую сумму
-                
-                # Достаем нашу склеенную JS-строку, которая сохранилась в истории ЮMoney
+                amount = operation.amount
                 raw_label = operation.label
+                
                 if raw_label and "|||" in raw_label:
                     username, message = raw_label.split("|||", 1)
                 elif raw_label:
                     username = raw_label
         except Exception as e:
-            print(f"⚠️ Ошибка фильтрации истории через API: {e}")
-            # Если API упало, пытаемся распарсить голый входящий label из вебхука
+            print(f"⚠️ Ошибка API ЮMoney при чтении истории: {e}")
             if "|||" in incoming_label:
                 username, message = incoming_label.split("|||", 1)
 
-    print(f"\n🎉 ХАБР-АЛЬФА ХУК ОБРАБОТАН!")
-    print(f"От кого: {username} | Сумма: {amount} руб.")
-    print(f"Сообщение: {message}")
+    print(f"\n🎉 ТРУ-АЛЬФА ХУК ОБРАБОТАН!")
+    print(f"От кого: {username} | Сумма: {amount} руб. | Текст: {message}")
     print("=" * 40)
     
-    # Добавляем данные в оперативку для нашего OBS-виджета
+    # Закидываем в очередь для OBS
     DONATIONS_QUEUE.append({
         "username": username,
         "amount": amount,
@@ -150,7 +201,7 @@ async def handle_yoomoney_webhook(request: Request):
     return {"status": "ok"}
 
 # =====================================================================
-# 3. РУЧКА ДЛЯ OBS (GET /get-donations)
+# 4. РУЧКА ДЛЯ OBS (GET /get-donations)
 # =====================================================================
 @app.get("/get-donations")
 async def get_donations():
