@@ -49,8 +49,8 @@ def write_to_google_sheet(username, amount, message):
         
     try:
         scopes = [
-            "https://googleapis.com",
-            "https://googleapis.com"
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
         ]
         
         # Авторизуемся под видом нашего сервисного аккаунта напрямую из секретного файла
