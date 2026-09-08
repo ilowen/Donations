@@ -1,16 +1,20 @@
 import os
 import uuid
+import json
+import datetime
 from urllib.parse import parse_qs
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from yoomoney import Quickpay
+from google.oauth2.service_account import Credentials
+import gspread
 import uvicorn
 
 app = FastAPI()
 
-# Включаем CORS для фронтенда и OBS
+# Включаем CORS, чтобы HTML-виджет из OBS и сайт могли общаться с бэкендом
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,10 +23,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🔐 Настройки кошелька из ENV-переменных Render
+# 🔐 Читаем настройки из обычных переменных окружения Render
 YOOMONEY_WALLET = os.environ.get("YOOMONEY_WALLET", "КОШЕЛЕК_НЕ_НАСТРОЕН")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 
-# 📦 База данных в оперативной памяти (ID заказа -> Ник + Сообщение)
+# База данных в оперативной памяти для связки ID заказа со зрителем
 DONATIONS_DB = {}
 
 class DonationOrder(BaseModel):
@@ -30,7 +35,42 @@ class DonationOrder(BaseModel):
     message: str
     amount: int
 
-# UI ФРОНТЕНД (GET /)
+# Функция отправки доната в Google Таблицу (читает файл из Secret Files)
+def write_to_google_sheet(username, amount, message):
+    secret_file_path = "learned-pact-242010-54a8a1daf93f.json"
+    
+    if not GOOGLE_SHEET_ID:
+        print("⚠️ Переменная GOOGLE_SHEET_ID не настроена в Environment!", flush=True)
+        return
+        
+    if not os.path.exists(secret_file_path):
+        print(f"⚠️ Секретный файл {secret_file_path} не найден в корне проекта!", flush=True)
+        return
+        
+    try:
+        scopes = [
+            "https://googleapis.com",
+            "https://googleapis.com"
+        ]
+        
+        # Авторизуемся под видом нашего сервисного аккаунта напрямую из секретного файла
+        creds = Credentials.from_service_account_file(secret_file_path, scopes=scopes)
+        client = gspread.authorize(creds)
+        
+        # Открываем таблицу по ID и берем первый лист
+        sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+        
+        # Текущее время
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Дописываем строку в конец таблицы: [Время, Ник, Сумма, Сообщение]
+        sheet.append_row([current_time, username, amount, message])
+        print("📊 Строка успешно записана в Google Таблицу через Secret File!", flush=True)
+    except Exception as e:
+        print(f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПИСИ В GOOGLE ТАБЛИЦУ: {e}", flush=True)
+# =====================================================================
+# 1. UI ФРОНТЕНД (GET /) - Форма отправляет fetch и ждет ответа бэкенда
+# =====================================================================
 @app.get("/", response_class=HTMLResponse)
 async def home_page():
     return """
@@ -106,12 +146,13 @@ async def home_page():
     </html>
     """
 
-# ГЕНЕРАТОР ЗАКАЗОВ (POST /create-order)
+# =====================================================================
+# 2. ГЕНЕРАТОР ЗАКАЗОВ (POST /create-order)
+# =====================================================================
 @app.post("/create-order")
 async def create_order(order: DonationOrder):
     order_id = f"ord_{uuid.uuid4().hex[:12]}"
     
-    # Сохраняем "товар" в память
     DONATIONS_DB[order_id] = {
         "username": order.username,
         "message": order.message,
@@ -131,48 +172,58 @@ async def create_order(order: DonationOrder):
     return JSONResponse(content={"url": quickpay.redirected_url, "order_id": order_id})
 
 # =====================================================================
-# ЛОВУШКА ХУКОВ НА ЧИСТЫХ БАЙТАХ (POST /webhook)
+# 3. ЛОВУШКА ХУКОВ НА ЧИСТЫХ БАЙТАХ (POST /webhook)
 # =====================================================================
 @app.post("/webhook")
 async def handle_yoomoney_webhook(request: Request):
-    # 读取原始字节，不再使用 request.form()，彻底摆脱 python-multipart
     body_bytes = await request.body()
     body_str = body_bytes.decode('utf-8')
     
-    # Парсим строку параметров формы в удобный словарь Python
     parsed_data = parse_qs(body_str)
     
-    # parse_qs возвращает значения списками, забираем первые элементы
-    incoming_label = parsed_data.get("label", [None])[0]
-    withdraw_amount = parsed_data.get("withdraw_amount", ["0"])[0]
+    labels_list = parsed_data.get("label", [])
+    incoming_label = labels_list[0] if labels_list else None
+    
+    amounts_list = parsed_data.get("withdraw_amount", ["0"])
+    withdraw_amount = amounts_list[0] if amounts_list else "0"
     
     if not incoming_label:
+        print("⚠️ Получен вебхук без поля label", flush=True)
         return {"status": "no_label"}
 
-    # Находим заказ в оперативной памяти по ID (label)
     if incoming_label in DONATIONS_DB:
         DONATIONS_DB[incoming_label]["status"] = "success"
         DONATIONS_DB[incoming_label]["amount"] = withdraw_amount
         
-        print(f"\n🎉 ТРУ-АЛЬФА ХУК ОБРАБОТАН НА БАЙТАХ!")
-        print(f"ID заказа: {incoming_label}")
-        print(f"От кого: {DONATIONS_DB[incoming_label]['username']}")
-        print(f"Сумма: {withdraw_amount} руб.")
-        print(f"Сообщение: {DONATIONS_DB[incoming_label]['message']}")
-        print("=" * 40)
+        user = DONATIONS_DB[incoming_label]["username"]
+        msg = DONATIONS_DB[incoming_label]["message"]
+
+        print(f"\\n🎉 ТРУ-АЛЬФА ХУК ОБРАБОТАН НА БАЙТАХ!", flush=True)
+        print(f"ID заказа: {incoming_label} | От кого: {user} | Сумма: {withdraw_amount} руб.", flush=True)
+        print(f"Сообщение: {msg}", flush=True)
+        print("=" * 40, flush=True)
+        
+        # Пишем в Google Таблицу через секретный файл
+        write_to_google_sheet(user, withdraw_amount, msg)
     else:
-        print(f"⚠️ Получен вебхук для неизвестного ID заказа: {incoming_label}")
+        print(f"⚠️ Получен вебхук для неизвестного ID заказа: {incoming_label}", flush=True)
         
     return {"status": "ok"}
 
-# ПРОВЕРКА СТАТУСА ДЛЯ UI (GET /check-status)
+# =====================================================================
+# 4. ПРОВЕРКА СТАТУСА ДЛЯ UI (GET /check-status)
+# =====================================================================
 @app.get("/check-status")
-async def check_status(order_id: str):
+async def check_status(order_id: str = None):
+    if not order_id:
+        return {"status": "pending"}
     if order_id in DONATIONS_DB and DONATIONS_DB[order_id]["status"] == "success":
         return {"status": "paid"}
     return {"status": "pending"}
 
-# РУЧКА ДЛЯ OBS (GET /get-donations)
+# =====================================================================
+# 5. РУЧКА ДЛЯ OBS (GET /get-donations)
+# =====================================================================
 @app.get("/get-donations")
 async def get_donations():
     paid_donations = []
