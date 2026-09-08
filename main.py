@@ -152,7 +152,7 @@ async def create_order(order: DonationOrder):
     )
     
     # Возвращаем готовую ссылку ЮMoney обратно в UI в формате JSON
-    return JSONResponse(content={"url": quickpay.base_url})
+    return JSONResponse(content={"url": quickpay.redirected_url})
 
 # =====================================================================
 # 3. ЛОВУШКА ХУКОВ + ФИЛЬТР ИСТОРИИ (POST /webhook)
