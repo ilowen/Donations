@@ -2,3 +2,5 @@ fastapi
 uvicorn
 yoomoney
 pydantic
+gspread
+google-auth
