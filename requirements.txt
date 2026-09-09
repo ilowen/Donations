@@ -4,3 +4,4 @@ yoomoney
 pydantic
 gspread
 google-auth
+supabase
