@@ -1,7 +1,9 @@
 import os
 import uuid
 import datetime
-from urllib.parse import parse_qs
+import hmac
+import hashlib
+from urllib.parse import parse_qs, quote
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -63,6 +65,7 @@ YOOMONEY_WALLET = os.environ.get(
     "КОШЕЛЕК_НЕ_НАСТРОЕН"
 )
 
+YOOMONEY_SECRET = os.environ.get("YOOMONEY_SECRET", "")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 
 
@@ -361,6 +364,11 @@ async def handle_yoomoney_webhook(request: Request):
     body_str = body_bytes.decode("utf-8")
 
     parsed_data = parse_qs(body_str)
+
+    # Проверяем подлинность уведомления YooMoney.
+    if not verify_yoomoney_sign(parsed_data):
+        print("❌ YooMoney webhook отклонен: неверная подпись", flush=True)
+        return {"status": "invalid_sign"}
 
     labels_list = parsed_data.get("label", [])
     incoming_label = labels_list[0] if labels_list else None
