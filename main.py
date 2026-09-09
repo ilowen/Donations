@@ -1,9 +1,7 @@
 import os
 import uuid
 import datetime
-import hmac
-import hashlib
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -11,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from yoomoney import Quickpay
 from supabase import create_client, Client
+import gspread
+from google.oauth2.service_account import Credentials
 import uvicorn
 
 
@@ -21,7 +21,7 @@ import uvicorn
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# Таблица и колонки оставлены ЖЕСТКО в коде.
+# Таблица депозитов — НЕ в ENV.
 DEPOSITS_TABLE = "deposits"
 DEPOSIT_USER_COLUMN = "username"
 DEPOSIT_BALANCE_COLUMN = "balance"
@@ -32,28 +32,30 @@ supabase_client: Client | None = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("✅ Supabase initialized", flush=True)
+        print("✅ Supabase client initialized", flush=True)
     except Exception as e:
         print(f"❌ Ошибка инициализации Supabase: {e}", flush=True)
 else:
     print("⚠️ SUPABASE_URL или SUPABASE_KEY не настроены", flush=True)
 
 
+# ============================================================
+# APP
+# ============================================================
+
 app = FastAPI()
 
-
-# Включаем CORS, чтобы HTML-виджет и сайт могли общаться с бэкендом
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
 
 # ============================================================
-# YOOMONEY
+# YOOMONEY — ЛОГИКА ОСТАВЛЕНА КАК В ТВОЁМ РАБОЧЕМ ВАРИАНТЕ
 # ============================================================
 
 YOOMONEY_WALLET = os.environ.get(
@@ -61,15 +63,14 @@ YOOMONEY_WALLET = os.environ.get(
     "КОШЕЛЕК_НЕ_НАСТРОЕН"
 )
 
-# Секретное слово из настроек HTTP-уведомлений YooMoney.
-YOOMONEY_SECRET = os.environ.get("YOOMONEY_SECRET", "")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 
 
-# База в памяти для связки ID заказа со зрителем.
+# Связка ID заказа со зрителем.
 DONATIONS_DB = {}
 
-# Защита от повторной обработки одной операции.
-PROCESSED_OPERATIONS = set()
+# Защита от повторной обработки одного order_id
+PROCESSED_ORDERS = set()
 
 
 class DonationOrder(BaseModel):
@@ -79,13 +80,73 @@ class DonationOrder(BaseModel):
 
 
 # ============================================================
-# SUPABASE: ПОПОЛНЕНИЕ ДЕПОЗИТА
+# GOOGLE SHEETS
+# ============================================================
+
+def write_to_google_sheet(username, amount, message, order_id=None):
+    """Добавляет строку о пополнении в Google Sheets."""
+
+    secret_file_path = "learned-pact-242010-54a8a1daf93f.json"
+
+    if not GOOGLE_SHEET_ID:
+        print(
+            "⚠️ Переменная GOOGLE_SHEET_ID не настроена в Environment!",
+            flush=True
+        )
+        return
+
+    if not os.path.exists(secret_file_path):
+        print(
+            f"⚠️ Секретный файл {secret_file_path} не найден в корне проекта!",
+            flush=True
+        )
+        return
+
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+
+        creds = Credentials.from_service_account_file(
+            secret_file_path,
+            scopes=scopes
+        )
+
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+
+        current_time = datetime.datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        sheet.append_row([
+            current_time,
+            username,
+            amount,
+            message,
+            order_id or ""
+        ])
+
+        print("📊 Строка успешно записана в Google Таблицу!", flush=True)
+
+    except Exception as e:
+        # Ошибка Excel/Google Sheets НЕ отменяет уже зачисленный депозит.
+        print(
+            f"❌ ОШИБКА ЗАПИСИ В GOOGLE ТАБЛИЦУ: {e}",
+            flush=True
+        )
+
+
+# ============================================================
+# SUPABASE: ПОПОЛНЕНИЕ DEPOSIT
 # ============================================================
 
 def add_to_deposit(username, amount):
     """
-    Читаем текущий balance пользователя из deposits,
-    прибавляем сумму платежа и сохраняем новый balance.
+    Читает текущий balance пользователя,
+    прибавляет фактически полученную сумму
+    и обновляет updated_at.
     """
 
     if not supabase_client:
@@ -112,9 +173,11 @@ def add_to_deposit(username, amount):
             result.data[0].get(DEPOSIT_BALANCE_COLUMN) or 0
         )
 
+        # ВАЖНО:
+        # amount — это фактически полученная сумма из withdraw_amount.
+        # Никакой проверки against order.amount здесь нет.
         new_balance = current_balance + float(amount)
 
-        # Обновляем баланс и время изменения.
         update_result = (
             supabase_client
             .table(DEPOSITS_TABLE)
@@ -128,11 +191,11 @@ def add_to_deposit(username, amount):
             .execute()
         )
 
-        # У некоторых версий supabase-py UPDATE может вернуть пустой data,
-        # даже когда запрос выполнен. Поэтому окончательно проверяем SELECT.
+        # Некоторые версии supabase могут не возвращать строки из UPDATE,
+        # поэтому дополнительно проверяем реальное значение чтением.
         if update_result.data is not None and len(update_result.data) == 0:
             print(
-                "⚠️ Supabase UPDATE не вернул строки, проверяем SELECT",
+                "⚠️ UPDATE выполнен, но Supabase не вернул строки",
                 flush=True
             )
 
@@ -163,70 +226,17 @@ def add_to_deposit(username, amount):
         return True, saved_balance
 
     except Exception as e:
-        print(f"❌ Ошибка UPDATE deposits: {e}", flush=True)
+        print(
+            f"❌ Ошибка UPDATE deposits: {e}",
+            flush=True
+        )
         return False, str(e)
 
 
 # ============================================================
-# YOOMONEY SIGN
+# 1. UI
 # ============================================================
 
-def verify_yoomoney_sign(parsed_data):
-    """
-    Проверяет параметр sign по актуальной схеме YooMoney:
-    - исключить sign;
-    - отсортировать параметры по имени;
-    - URL-кодировать значения;
-    - собрать key=value через &;
-    - HMAC-SHA256 с секретным ключом.
-    """
-
-    if not YOOMONEY_SECRET:
-        print("❌ YOOMONEY_SECRET не настроен", flush=True)
-        return False
-
-    received_list = parsed_data.get("sign", [])
-    received_sign = received_list[0] if received_list else ""
-
-    if not received_sign:
-        print("❌ YooMoney webhook без sign", flush=True)
-        return False
-
-    values = {}
-
-    for key, value_list in parsed_data.items():
-        if key == "sign":
-            continue
-
-        values[key] = value_list[0] if value_list else ""
-
-    prepared = "&".join(
-        f"{quote(key, safe='')}={quote(values[key], safe='')}"
-        for key in sorted(values)
-    )
-
-    calculated_sign = hmac.new(
-        YOOMONEY_SECRET.encode("utf-8"),
-        prepared.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-
-    valid = hmac.compare_digest(
-        calculated_sign.lower(),
-        received_sign.lower()
-    )
-
-    print(
-        "✅ YooMoney sign OK" if valid else "❌ YooMoney sign INVALID",
-        flush=True
-    )
-
-    return valid
-
-
-# =====================================================================
-# 1. UI ФРОНТЕНД (GET /)
-# =====================================================================
 @app.get("/", response_class=HTMLResponse)
 async def home_page():
     return """
@@ -283,17 +293,13 @@ async def home_page():
                             submitBtn.innerText = "Ожидание оплаты...";
 
                             const interval = setInterval(async () => {
-                                try {
-                                    const statusResp = await fetch(`/check-status?order_id=${data.order_id}`);
-                                    const statusData = await statusResp.json();
+                                const statusResp = await fetch(`/check-status?order_id=${data.order_id}`);
+                                const statusData = await statusResp.json();
 
-                                    if (statusData.status === 'paid') {
-                                        clearInterval(interval);
-                                        submitBtn.innerText = `Успешно оплачено! 🎉`;
-                                        submitBtn.style.background = "#2e7d32";
-                                    }
-                                } catch (e) {
-                                    console.error(e);
+                                if (statusData.status === 'paid') {
+                                    clearInterval(interval);
+                                    submitBtn.innerText = `Успешно оплачено! 🎉`;
+                                    submitBtn.style.background = "#2e7d32";
                                 }
                             }, 3000);
                         } else {
@@ -312,9 +318,10 @@ async def home_page():
     """
 
 
-# =====================================================================
-# 2. ГЕНЕРАТОР ЗАКАЗОВ (POST /create-order)
-# =====================================================================
+# ============================================================
+# 2. ГЕНЕРАТОР ЗАКАЗОВ
+# ============================================================
+
 @app.post("/create-order")
 async def create_order(order: DonationOrder):
     order_id = f"ord_{uuid.uuid4().hex[:12]}"
@@ -326,6 +333,7 @@ async def create_order(order: DonationOrder):
         "status": "pending"
     }
 
+    # YooMoney-логика оставлена как в исходнике.
     quickpay = Quickpay(
         receiver=YOOMONEY_WALLET,
         quickpay_form="shop",
@@ -333,11 +341,6 @@ async def create_order(order: DonationOrder):
         paymentType="AC",
         sum=order.amount,
         label=order_id
-    )
-
-    print(
-        f"✅ Создан заказ {order_id}: {order.username}, {order.amount} руб.",
-        flush=True
     )
 
     return JSONResponse(
@@ -348,76 +351,27 @@ async def create_order(order: DonationOrder):
     )
 
 
-# =====================================================================
-# 3. YOOMONEY WEBHOOK (POST /webhook)
-# =====================================================================
+# ============================================================
+# 3. YOOMONEY WEBHOOK
+# ============================================================
+
 @app.post("/webhook")
 async def handle_yoomoney_webhook(request: Request):
     body_bytes = await request.body()
     body_str = body_bytes.decode("utf-8")
 
-    parsed_data = parse_qs(body_str, keep_blank_values=True)
-
-    print(
-        f"📩 YooMoney webhook: {parsed_data}",
-        flush=True
-    )
-
-    # Проверяем подпись до начисления денег.
-    if not verify_yoomoney_sign(parsed_data):
-        return JSONResponse(
-            status_code=403,
-            content={"status": "invalid_signature"}
-        )
-
-    notification_type = parsed_data.get("notification_type", [""])[0]
-    operation_id = parsed_data.get("operation_id", [""])[0]
+    parsed_data = parse_qs(body_str)
 
     labels_list = parsed_data.get("label", [])
     incoming_label = labels_list[0] if labels_list else None
 
-    # amount — сумма, которая зачислена на кошелек получателя.
-    amounts_list = parsed_data.get("amount", ["0"])
-    incoming_amount = amounts_list[0] if amounts_list else "0"
-
-    # Оставляем fallback для совместимости со старым кодом.
-    if incoming_amount in (None, "", "0", "0.00"):
-        amounts_list = parsed_data.get("withdraw_amount", ["0"])
-        incoming_amount = amounts_list[0] if amounts_list else "0"
-
-    unaccepted = parsed_data.get("unaccepted", ["false"])[0]
-
-    if notification_type not in ("p2p-incoming", "card-incoming"):
-        print(
-            f"⚠️ Неизвестный notification_type: {notification_type}",
-            flush=True
-        )
-        return {"status": "ignored"}
-
-    if unaccepted == "true":
-        print("⚠️ Платеж unaccepted=true, не зачисляем", flush=True)
-        return {"status": "unaccepted"}
-
-    if not operation_id:
-        print("⚠️ Webhook без operation_id", flush=True)
-        return {"status": "no_operation_id"}
+    amounts_list = parsed_data.get("withdraw_amount", ["0"])
+    withdraw_amount = amounts_list[0] if amounts_list else "0"
 
     if not incoming_label:
         print("⚠️ Получен вебхук без поля label", flush=True)
         return {"status": "no_label"}
 
-    # Защита от повторного webhook.
-    if operation_id in PROCESSED_OPERATIONS:
-        print(
-            f"⚠️ Повторный webhook operation_id={operation_id}",
-            flush=True
-        )
-        return {
-            "status": "ok",
-            "already_processed": True
-        }
-
-    # Ищем заказ.
     if incoming_label not in DONATIONS_DB:
         print(
             f"⚠️ Получен вебхук для неизвестного ID заказа: {incoming_label}",
@@ -425,50 +379,66 @@ async def handle_yoomoney_webhook(request: Request):
         )
         return {"status": "ok"}
 
-    if DONATIONS_DB[incoming_label]["status"] == "success":
-        PROCESSED_OPERATIONS.add(operation_id)
+    if (
+        incoming_label in PROCESSED_ORDERS
+        or DONATIONS_DB[incoming_label]["status"] == "success"
+    ):
+        print(
+            f"⚠️ Повторный webhook для уже обработанного заказа: {incoming_label}",
+            flush=True
+        )
         return {
             "status": "ok",
             "already_processed": True
         }
 
     try:
-        amount = float(incoming_amount)
+        amount = float(withdraw_amount)
     except (TypeError, ValueError):
         print(
-            f"❌ Некорректная сумма в webhook: {incoming_amount}",
+            f"❌ Некорректная сумма в webhook: {withdraw_amount}",
             flush=True
         )
         return {"status": "bad_amount"}
 
     if amount <= 0:
-        print(f"❌ Сумма платежа <= 0: {amount}", flush=True)
-        return {"status": "bad_amount"}
-
-    # Проверяем, что пришло не меньше суммы заказа.
-    expected_amount = float(DONATIONS_DB[incoming_label]["amount"])
-    if amount < expected_amount:
         print(
-            f"❌ Сумма меньше заказа: ожидалось {expected_amount}, получено {amount}",
+            f"❌ Сумма платежа <= 0: {amount}",
             flush=True
         )
-        return {"status": "amount_mismatch"}
+        return {"status": "bad_amount"}
 
     user = DONATIONS_DB[incoming_label]["username"]
     msg = DONATIONS_DB[incoming_label]["message"]
 
-    print("\n🎉 ТРУ-АЛЬФА ХУК ОБРАБОТАН НА БАЙТАХ!", flush=True)
     print(
-        f"ID заказа: {incoming_label} | От кого: {user} | Сумма: {amount} руб.",
+        "\n🎉 ТРУ-АЛЬФА ХУК ОБРАБОТАН НА БАЙТАХ!",
         flush=True
     )
-    print(f"Сообщение: {msg}", flush=True)
+    print(
+        f"ID заказа: {incoming_label} | "
+        f"От кого: {user} | "
+        f"Сумма: {amount} руб.",
+        flush=True
+    )
+    print(
+        f"Сообщение: {msg}",
+        flush=True
+    )
     print("=" * 40, flush=True)
 
-    # ========================================================
-    # Пополняем депозит в Supabase.
-    # ========================================================
-    success, result = add_to_deposit(user, amount)
+    # ---------------------------------------------------------
+    # 1. Пополняем текущий депозит в Supabase.
+    # ---------------------------------------------------------
+    # Никакого сравнения amount с order.amount.
+    # Если YooMoney прислал 1.98 после комиссии — в депозит
+    # уходит именно 1.98.
+    # ---------------------------------------------------------
+
+    success, result = add_to_deposit(
+        user,
+        amount
+    )
 
     if not success:
         print(
@@ -476,25 +446,35 @@ async def handle_yoomoney_webhook(request: Request):
             flush=True
         )
 
-        # 500 заставит YooMoney повторить уведомление.
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "deposit_update_error",
-                "message": result
-            }
-        )
+        # Не отмечаем заказ успешным, чтобы проблема не потерялась.
+        return {
+            "status": "deposit_update_error",
+            "message": result
+        }
 
-    # Помечаем заказ обработанным только ПОСЛЕ успешного UPDATE.
+    # ---------------------------------------------------------
+    # 2. Пишем платеж в Google Sheets.
+    # ---------------------------------------------------------
+
+    write_to_google_sheet(
+        user,
+        amount,
+        msg,
+        incoming_label
+    )
+
+    # ---------------------------------------------------------
+    # 3. Отмечаем заказ обработанным.
+    # ---------------------------------------------------------
+
     DONATIONS_DB[incoming_label]["status"] = "success"
     DONATIONS_DB[incoming_label]["amount"] = amount
     DONATIONS_DB[incoming_label]["balance"] = result
-    DONATIONS_DB[incoming_label]["operation_id"] = operation_id
-
-    PROCESSED_OPERATIONS.add(operation_id)
+    PROCESSED_ORDERS.add(incoming_label)
 
     print(
-        f"✅ Платеж зачислен: {user} + {amount} руб. | Новый баланс: {result}",
+        f"✅ Платеж зачислен: {user} + {amount} руб. | "
+        f"Новый баланс: {result}",
         flush=True
     )
 
@@ -507,9 +487,10 @@ async def handle_yoomoney_webhook(request: Request):
     }
 
 
-# =====================================================================
-# 4. ПРОВЕРКА СТАТУСА ДЛЯ UI (GET /check-status)
-# =====================================================================
+# ============================================================
+# 4. ПРОВЕРКА СТАТУСА ДЛЯ UI
+# ============================================================
+
 @app.get("/check-status")
 async def check_status(order_id: str = None):
     if not order_id:
@@ -524,18 +505,9 @@ async def check_status(order_id: str = None):
     return {"status": "pending"}
 
 
-# =====================================================================
-# HEALTH
-# =====================================================================
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "supabase": supabase_client is not None,
-        "yoomoney_wallet": bool(YOOMONEY_WALLET),
-        "yoomoney_secret": bool(YOOMONEY_SECRET)
-    }
-
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
