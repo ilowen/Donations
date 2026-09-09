@@ -83,14 +83,14 @@ def write_to_google_sheet(username, amount, message):
 
 
 # Новая функция для вставки в Supabase
-def insert_into_supabase(order_id, username, message, amount):
+def insert_into_supabase(order_id, username, message, amount, supabase_client=None):
     """
     Вставляет запись о заполнении депозита в Supabase.
     """
-    # Проверяем, что supabase_client установлен и рабочий
+    # Проверяем, что supabase_client установлен и имеет метод query
     if not supabase_client or not hasattr(supabase_client, 'query'):
-        print("⚠️ Supabase не настроен или не инициализирован корректно", flush=True)
-        return
+        print("⚠️ Supabase не настроен или не инициализирован", flush=True)
+        return False
     
     try:
         query = """
@@ -243,7 +243,7 @@ async def handle_yoomoney_webhook(request: Request):
         print("=" * 40, flush=True)
         
         # Записываем в Supabase вместо Google Sheets
-        success = insert_into_supabase(incoming_label, user, msg, withdraw_amount)
+        success = insert_into_supabase(incoming_label, user, msg, withdraw_amount, supabase_client)
         if success:
             print("✅ Запись в Supabase успешна", flush=True)
         else:
