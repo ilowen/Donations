@@ -11,16 +11,13 @@ from yoomoney import Quickpay
 import uvicorn
 
 
-# Supabase configuration
+# Supabase configuration - will be checked at runtime
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-supabase_client = None
-if SUPABASE_URL and SUPABASE_KEY:
-    from supabase import create_client
-    supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 app = FastAPI()
+
 
 # Включаем CORS, чтобы HTML-виджет из OBS и сайт могли общаться с бэкендом
 app.add_middleware(
@@ -31,12 +28,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # 🔐 Читаем настройки из обычных переменных окружения Render
 YOOMONEY_WALLET = os.environ.get("YOOMONEY_WALLET", "КОШЕЛЕК_НЕ_НАСТРОЕН")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 
+
 # База данных в оперативной памяти для связки ID заказа со зрителем
 DONATIONS_DB = {}
+
 
 class DonationOrder(BaseModel):
     username: str
@@ -87,8 +87,9 @@ def insert_into_supabase(order_id, username, message, amount):
     """
     Вставляет запись о заполнении депозита в Supabase.
     """
-    if not supabase_client:
-        print("⚠️ Supabase не настроен - не можем записать в базу", flush=True)
+    # Проверяем, что supabase_client установлен и рабочий
+    if not supabase_client or not hasattr(supabase_client, 'query'):
+        print("⚠️ Supabase не настроен или не инициализирован корректно", flush=True)
         return
     
     try:
@@ -96,10 +97,12 @@ def insert_into_supabase(order_id, username, message, amount):
         INSERT INTO donations (id, username, message, amount, created_at)
         VALUES ($1, $2, $3, $4, NOW())
         """
-        supabase_client.query(query, [order_id, username, message, amount])
+        result = supabase_client.query(query, [order_id, username, message, amount])
         print(f"✅ Запись успешно вставлена в Supabase (ID: {order_id})", flush=True)
+        return True
     except Exception as e:
         print(f"❌ Ошибка при вставке в Supabase: {e}", flush=True)
+        return False
 
 
 # =====================================================================
@@ -240,7 +243,11 @@ async def handle_yoomoney_webhook(request: Request):
         print("=" * 40, flush=True)
         
         # Записываем в Supabase вместо Google Sheets
-        insert_into_supabase(incoming_label, user, msg, withdraw_amount)
+        success = insert_into_supabase(incoming_label, user, msg, withdraw_amount)
+        if success:
+            print("✅ Запись в Supabase успешна", flush=True)
+        else:
+            print("❌ Не удалось записать в Supabase", flush=True)
     else:
         print(f"⚠️ Получен вебхук для неизвестного ID заказа: {incoming_label}", flush=True)
         
