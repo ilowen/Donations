@@ -1,86 +1,58 @@
 import os
 import uuid
-import datetime
-from decimal import Decimal, InvalidOperation
+import json
+from datetime import datetime, timezone
 from urllib.parse import parse_qs
-
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from yoomoney import Quickpay
-from supabase import create_client, Client
 
 import gspread
 from google.oauth2.service_account import Credentials
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from supabase import create_client, Client
+from yoomoney import Quickpay
 
 import uvicorn
 
 
 # ============================================================
-# CONFIG
+# ENV
 # ============================================================
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-YOOMONEY_WALLET = os.environ.get(
-    "YOOMONEY_WALLET",
-    "КОШЕЛЕК_НЕ_НАСТРОЕН"
-)
+YOOMONEY_WALLET = os.getenv("YOOMONEY_WALLET")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+# Таблица депозитов в Supabase
+DEPOSITS_TABLE = "deposits"
 
-# Таблица текущих депозитов
-DEPOSITS_TABLE = os.environ.get("DEPOSITS_TABLE", "deposits")
+# Колонки таблицы deposits
+DEPOSIT_USER_COLUMN = "username"
+DEPOSIT_BALANCE_COLUMN = "balance"
+DEPOSIT_UPDATED_COLUMN = "updated_at"
 
-# Названия колонок в deposits
-DEPOSIT_USER_COLUMN = os.environ.get(
-    "DEPOSIT_USER_COLUMN",
-    "username"
-)
-
-DEPOSIT_BALANCE_COLUMN = os.environ.get(
-    "DEPOSIT_BALANCE_COLUMN",
-    "balance"
-)
-
-# Файл Google Service Account
-GOOGLE_SECRET_FILE = os.environ.get(
-    "GOOGLE_SECRET_FILE",
-    "learned-pact-242010-54a8a1daf93f.json"
-)
+# Google service account
+GOOGLE_CREDENTIALS_FILE = "learned-pact-242010-54a8a1daf93f.json"
 
 
 # ============================================================
 # SUPABASE
 # ============================================================
 
-supabase: Client | None = None
+supabase_client: Client | None = None
 
 if SUPABASE_URL and SUPABASE_KEY:
-    try:
-        supabase = create_client(
-            SUPABASE_URL,
-            SUPABASE_KEY
-        )
-
-        print("✅ Supabase client initialized", flush=True)
-
-    except Exception as e:
-        print(
-            f"❌ Ошибка инициализации Supabase: {e}",
-            flush=True
-        )
-else:
-    print(
-        "⚠️ SUPABASE_URL или SUPABASE_KEY не настроены",
-        flush=True
+    supabase_client = create_client(
+        SUPABASE_URL,
+        SUPABASE_KEY
     )
 
 
 # ============================================================
-# APP
+# FASTAPI
 # ============================================================
 
 app = FastAPI()
@@ -96,41 +68,19 @@ app.add_middleware(
 
 
 # ============================================================
-# TEMPORARY ORDERS CACHE
+# TEMPORARY ORDERS
 # ============================================================
-
-# Здесь НЕ хранится баланс.
-#
-# Это только временная связка:
-#
-# order_id -> пользователь / сообщение / сумма / статус
-#
-# Основной баланс находится в Supabase deposits.
 
 DONATIONS_DB = {}
 
-
-# ============================================================
-# PROCESSED ORDERS
-# ============================================================
-
-# Защита от повторной обработки одного webhook
-#
-# Пока сервис запущен.
-#
-# Основной журнал операций всё равно находится в Google Sheets.
-
+# Защита от повторной обработки webhook в рамках жизни процесса
 PROCESSED_ORDERS = set()
 
-
-# ============================================================
-# MODELS
-# ============================================================
 
 class DonationOrder(BaseModel):
     username: str
     message: str
-    amount: int
+    amount: float
 
 
 # ============================================================
@@ -140,137 +90,74 @@ class DonationOrder(BaseModel):
 def write_to_google_sheet(
     order_id: str,
     username: str,
-    amount,
+    amount: float,
     message: str,
-    status: str = "paid"
+    status: str
 ):
-    """
-    Добавляет лог платежа в Google Sheets.
-
-    Supabase здесь НЕ заменяется Google Sheets.
-    Supabase = текущий депозит.
-    Google Sheets = журнал платежей.
-    """
-
-    if not GOOGLE_SHEET_ID:
-        print(
-            "⚠️ GOOGLE_SHEET_ID не настроен",
-            flush=True
-        )
-        return False
-
-    if not os.path.exists(GOOGLE_SECRET_FILE):
-        print(
-            f"⚠️ Файл {GOOGLE_SECRET_FILE} не найден",
-            flush=True
-        )
-        return False
-
     try:
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
+            "https://www.googleapis.com/auth/drive",
         ]
 
-        creds = Credentials.from_service_account_file(
-            GOOGLE_SECRET_FILE,
+        credentials = Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS_FILE,
             scopes=scopes
         )
 
-        client = gspread.authorize(creds)
+        gc = gspread.authorize(credentials)
 
-        sheet = client.open_by_key(
-            GOOGLE_SHEET_ID
-        ).sheet1
+        sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
 
-        current_time = datetime.datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        now = datetime.now(timezone.utc).isoformat()
 
-        row = [
-            current_time,
+        sheet.append_row([
+            now,
             order_id,
             username,
             amount,
             message,
             status
-        ]
-
-        sheet.append_row(row)
+        ])
 
         print(
-            "📊 Платёж записан в Google Sheets",
-            flush=True
+            f"✅ Google Sheets: "
+            f"{username} / {amount} / {status}"
         )
-
-        return True
 
     except Exception as e:
-        print(
-            f"❌ Ошибка записи в Google Sheets: {e}",
-            flush=True
-        )
-
-        return False
+        print(f"❌ Ошибка Google Sheets: {e}")
 
 
 # ============================================================
-# SUPABASE DEPOSIT UPDATE
+# DEPOSIT UPDATE
 # ============================================================
 
 def add_to_deposit(
     username: str,
-    amount
+    amount: float
 ):
     """
-    Пополняет существующий депозит пользователя.
+    Читаем текущий баланс и прибавляем к нему сумму платежа.
 
-    ВАЖНО:
-    - RPC НЕ используется.
-    - transaction table НЕ используется.
-    - создаётся/изменяется только текущий balance.
-    - ничего не удаляется.
+    Пример:
 
-    Логика:
+    balance = 1000
+    amount = 500
 
-        SELECT текущий balance
-              ↓
-        balance + amount
-              ↓
-        UPDATE deposits
+    new balance = 1500
     """
 
-    if supabase is None:
-        print(
-            "❌ Supabase client не инициализирован",
-            flush=True
-        )
-        return False, None
-
-    try:
-        amount_decimal = Decimal(str(amount))
-
-    except (InvalidOperation, ValueError):
-        print(
-            f"❌ Некорректная сумма: {amount}",
-            flush=True
-        )
-        return False, None
-
-    if amount_decimal <= 0:
-        print(
-            f"❌ Сумма должна быть > 0: {amount}",
-            flush=True
-        )
-        return False, None
+    if supabase_client is None:
+        return False, "Supabase не настроен"
 
     try:
         # ----------------------------------------------------
-        # Получаем текущий счёт
+        # Получаем текущий баланс
         # ----------------------------------------------------
 
         result = (
-            supabase
+            supabase_client
             .table(DEPOSITS_TABLE)
             .select(DEPOSIT_BALANCE_COLUMN)
             .eq(DEPOSIT_USER_COLUMN, username)
@@ -279,353 +166,275 @@ def add_to_deposit(
         )
 
         if not result.data:
-            print(
-                f"❌ Депозит пользователя не найден: {username}",
-                flush=True
+            return False, (
+                f"Счет пользователя '{username}' "
+                f"не найден в {DEPOSITS_TABLE}"
             )
 
-            return False, None
-
-        current_value = result.data[0].get(
-            DEPOSIT_BALANCE_COLUMN,
-            0
-        )
-
-        try:
-            current_balance = Decimal(
-                str(current_value or 0)
-            )
-
-        except (InvalidOperation, ValueError):
-            print(
-                f"❌ Некорректный текущий balance: "
-                f"{current_value}",
-                flush=True
-            )
-
-            return False, None
-
-        # ----------------------------------------------------
-        # Новый баланс
-        # ----------------------------------------------------
-
-        new_balance = current_balance + amount_decimal
-
-        # Если в БД numeric — передаём число,
-        # а не Decimal object.
-        new_balance_value = float(new_balance)
-
-        print(
-            f"💰 {username}: "
-            f"{current_balance} + {amount_decimal} "
-            f"= {new_balance}",
-            flush=True
+        current_balance = float(
+            result.data[0].get(DEPOSIT_BALANCE_COLUMN) or 0
         )
 
         # ----------------------------------------------------
-        # UPDATE deposits
+        # ПРИБАВЛЯЕМ сумму платежа
         # ----------------------------------------------------
+
+        new_balance = current_balance + float(amount)
+
+        # ----------------------------------------------------
+        # Обновляем баланс + дату изменения
+        # ----------------------------------------------------
+
+        update_data = {
+            DEPOSIT_BALANCE_COLUMN: new_balance,
+            DEPOSIT_UPDATED_COLUMN:
+                datetime.now(timezone.utc).isoformat()
+        }
 
         update_result = (
-            supabase
+            supabase_client
             .table(DEPOSITS_TABLE)
-            .update({
-                DEPOSIT_BALANCE_COLUMN: new_balance_value
-            })
+            .update(update_data)
             .eq(DEPOSIT_USER_COLUMN, username)
             .execute()
         )
 
-        # ----------------------------------------------------
-        # Проверяем, что UPDATE действительно прошёл
-        # ----------------------------------------------------
-
         if not update_result.data:
-            print(
-                "❌ Supabase не вернул обновлённую запись",
-                flush=True
+            return False, (
+                "UPDATE deposits не вернул "
+                "измененную запись"
             )
-
-            return False, None
-
-        # Проверяем фактическое значение
-        updated_balance = update_result.data[0].get(
-            DEPOSIT_BALANCE_COLUMN
-        )
-
-        if updated_balance is None:
-            print(
-                "❌ Supabase UPDATE выполнен, "
-                "но balance не вернулся",
-                flush=True
-            )
-
-            return False, None
 
         print(
-            f"✅ Депозит обновлён: "
-            f"{username} = {updated_balance}",
-            flush=True
+            f"✅ DEPOSIT UPDATE: "
+            f"{username}: "
+            f"{current_balance} + {amount} = {new_balance}"
         )
 
-        return True, updated_balance
+        return True, new_balance
 
     except Exception as e:
+        print(f"❌ Ошибка UPDATE deposits: {e}")
 
-        print(
-            f"❌ Ошибка UPDATE deposits: {e}",
-            flush=True
-        )
-
-        return False, None
+        return False, str(e)
 
 
 # ============================================================
 # HOME PAGE
 # ============================================================
 
-@app.get("/", response_class=HTMLResponse)
-async def home_page():
-
+@app.get("/")
+async def home():
     return """
+    <!DOCTYPE html>
     <html>
-        <head>
-            <meta charset="UTF-8">
-            <title>YooMoney True Order Donat</title>
+    <head>
+        <meta charset="UTF-8">
+        <title>Donations</title>
 
-            <style>
-                body {
-                    font-family: Arial, sans-serif;
-                    max-width: 400px;
-                    margin: 50px auto;
-                    padding: 20px;
-                    background: #f4f4f9;
-                    text-align: center;
-                }
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 900px;
+                margin: 40px auto;
+                padding: 20px;
+            }
 
-                .card {
-                    background: white;
-                    padding: 30px;
-                    border-radius: 10px;
-                    box-shadow:
-                        0 4px 6px rgba(0,0,0,0.1);
-                }
+            input, textarea, button {
+                width: 100%;
+                padding: 10px;
+                margin-top: 8px;
+                margin-bottom: 15px;
+                box-sizing: border-box;
+            }
 
-                input,
-                textarea,
-                button {
-                    width: 100%;
-                    padding: 12px;
-                    margin: 8px 0;
-                    border: 1px solid #ccc;
-                    border-radius: 6px;
-                    box-sizing: border-box;
-                }
+            button {
+                cursor: pointer;
+            }
 
-                button {
-                    background: #8a2be2;
-                    color: white;
-                    font-weight: bold;
-                    cursor: pointer;
-                    border: none;
-                    font-size: 16px;
-                }
+            .donation {
+                border: 1px solid #ddd;
+                padding: 12px;
+                margin-top: 10px;
+                border-radius: 8px;
+            }
+        </style>
+    </head>
 
-                button:hover {
-                    background: #6a1b9a;
-                }
+    <body>
 
-                textarea {
-                    resize: none;
-                    height: 80px;
-                }
+        <h1>Donation</h1>
 
-                h2 {
-                    color: #333;
-                }
-            </style>
-        </head>
+        <form id="donationForm">
 
-        <body>
+            <label>Username</label>
+            <input
+                type="text"
+                id="username"
+                required
+            >
 
-            <div class="card">
+            <label>Message</label>
+            <textarea
+                id="message"
+            ></textarea>
 
-                <h2>Отправить донат</h2>
+            <label>Amount</label>
+            <input
+                type="number"
+                id="amount"
+                step="0.01"
+                min="1"
+                required
+            >
 
-                <form
-                    id="donationForm"
-                    onsubmit="sendDonationRequest(event)"
-                >
+            <button type="submit">
+                Donate
+            </button>
 
-                    <input
-                        type="text"
-                        id="username"
-                        placeholder="Ваш никнейм"
-                        required
-                        maxlength="20"
-                    >
+        </form>
 
-                    <textarea
-                        id="message"
-                        placeholder="Текст сообщения доната..."
-                        maxlength="200"
-                    ></textarea>
+        <div id="result"></div>
 
-                    <input
-                        type="number"
-                        id="amount"
-                        placeholder="Сумма (руб)"
-                        min="2"
-                        value="100"
-                        required
-                    >
+        <h2>Donations</h2>
 
-                    <button
-                        type="submit"
-                        id="submitBtn"
-                    >
-                        Поддержать
-                    </button>
+        <div id="donations"></div>
 
-                </form>
+        <script>
 
-                <p
-                    style="
-                        color: gray;
-                        font-size: 11px;
-                        margin-top: 15px;
-                    "
-                >
-                    Донат-сервер: СТАТУС АКТИВЕН 🟢
-                </p>
+        const form = document.getElementById(
+            "donationForm"
+        );
 
-            </div>
+        const result = document.getElementById(
+            "result"
+        );
 
+        form.addEventListener(
+            "submit",
+            async (event) => {
 
-            <script>
+                event.preventDefault();
 
-                async function sendDonationRequest(event) {
+                const username =
+                    document.getElementById(
+                        "username"
+                    ).value;
 
-                    event.preventDefault();
+                const message =
+                    document.getElementById(
+                        "message"
+                    ).value;
 
-                    const submitBtn =
-                        document.getElementById('submitBtn');
+                const amount =
+                    parseFloat(
+                        document.getElementById(
+                            "amount"
+                        ).value
+                    );
 
-                    submitBtn.innerText =
-                        "Создание заказа...";
+                const response =
+                    await fetch(
+                        "/create-order",
+                        {
+                            method: "POST",
+                            headers: {
+                                "Content-Type":
+                                    "application/json"
+                            },
 
-                    submitBtn.disabled = true;
-
-
-                    const payload = {
-
-                        username:
-                            document
-                            .getElementById('username')
-                            .value
-                            .trim() || 'Аноним',
-
-                        message:
-                            document
-                            .getElementById('message')
-                            .value
-                            .trim() || 'Без сообщения',
-
-                        amount:
-                            parseInt(
-                                document
-                                .getElementById('amount')
-                                .value
-                            ) || 100
-                    };
-
-
-                    try {
-
-                        const response =
-                            await fetch(
-                                '/create-order',
-                                {
-                                    method: 'POST',
-
-                                    headers: {
-                                        'Content-Type':
-                                            'application/json'
-                                    },
-
-                                    body:
-                                        JSON.stringify(payload)
-                                }
-                            );
-
-
-                        const data =
-                            await response.json();
-
-
-                        if (
-                            data.url &&
-                            data.order_id
-                        ) {
-
-                            window.open(
-                                data.url,
-                                '_blank'
-                            );
-
-
-                            submitBtn.innerText =
-                                "Ожидание оплаты...";
-
-
-                            const interval =
-                                setInterval(
-                                    async () => {
-
-                                        const statusResp =
-                                            await fetch(
-                                                `/check-status?order_id=${data.order_id}`
-                                            );
-
-                                        const statusData =
-                                            await statusResp.json();
-
-
-                                        if (
-                                            statusData.status
-                                            === 'paid'
-                                        ) {
-
-                                            clearInterval(
-                                                interval
-                                            );
-
-                                            submitBtn.innerText =
-                                                `Успешно оплачено! 🎉`;
-
-                                            submitBtn.style.background =
-                                                "#2e7d32";
-                                        }
-
-                                    },
-                                    3000
-                                );
+                            body: JSON.stringify({
+                                username,
+                                message,
+                                amount
+                            })
                         }
+                    );
 
-                    } catch (err) {
+                const data =
+                    await response.json();
 
-                        console.error(err);
+                if (data.payment_url) {
 
-                        submitBtn.innerText =
-                            "Поддержать";
+                    result.innerHTML =
+                        `<a href="${data.payment_url}"
+                           target="_blank">
+                           Оплатить
+                         </a>`;
 
-                        submitBtn.disabled = false;
-                    }
+                } else {
+
+                    result.textContent =
+                        data.error || "Ошибка";
+
+                }
+            }
+        );
+
+
+        async function loadDonations() {
+
+            try {
+
+                const response =
+                    await fetch(
+                        "/get-donations"
+                    );
+
+                const data =
+                    await response.json();
+
+                const container =
+                    document.getElementById(
+                        "donations"
+                    );
+
+                container.innerHTML = "";
+
+                for (
+                    const donation of data
+                ) {
+
+                    const div =
+                        document.createElement(
+                            "div"
+                        );
+
+                    div.className = "donation";
+
+                    div.innerHTML = `
+                        <strong>
+                            ${donation.username}
+                        </strong>
+
+                        — ${donation.amount}
+
+                        <br>
+
+                        ${donation.message}
+                    `;
+
+                    container.appendChild(div);
                 }
 
-            </script>
+            } catch (error) {
 
-        </body>
+                console.error(error);
+
+            }
+        }
+
+
+        setInterval(
+            loadDonations,
+            3000
+        );
+
+        loadDonations();
+
+        </script>
+
+    </body>
     </html>
     """
 
@@ -637,44 +446,40 @@ async def home_page():
 @app.post("/create-order")
 async def create_order(order: DonationOrder):
 
-    order_id = (
-        f"ord_{uuid.uuid4().hex[:12]}"
-    )
+    order_id = "ord_" + uuid.uuid4().hex
 
     DONATIONS_DB[order_id] = {
-
         "username": order.username,
-
         "message": order.message,
-
         "amount": order.amount,
-
         "status": "pending"
     }
 
+    try:
 
-    quickpay = Quickpay(
+        quickpay = Quickpay(
+            receiver=YOOMONEY_WALLET,
+            quickpay_form="shop",
+            targets=order.message,
+            paymentType="AC",
+            sum=order.amount,
+            label=order_id
+        )
 
-        receiver=YOOMONEY_WALLET,
+        payment_url = quickpay.redirected_url
 
-        quickpay_form="shop",
-
-        targets="Поддержка стрима",
-
-        paymentType="AC",
-
-        sum=order.amount,
-
-        label=order_id
-    )
-
-
-    return JSONResponse(
-        content={
-            "url": quickpay.redirected_url,
-            "order_id": order_id
+        return {
+            "order_id": order_id,
+            "payment_url": payment_url
         }
-    )
+
+    except Exception as e:
+
+        print(f"❌ Ошибка создания заказа: {e}")
+
+        return {
+            "error": str(e)
+        }
 
 
 # ============================================================
@@ -682,333 +487,169 @@ async def create_order(order: DonationOrder):
 # ============================================================
 
 @app.post("/webhook")
-async def handle_yoomoney_webhook(
-    request: Request
-):
+async def webhook(request: Request):
 
-    body_bytes = await request.body()
-
-    body_str = body_bytes.decode(
-        "utf-8",
-        errors="replace"
-    )
-
-    parsed_data = parse_qs(body_str)
-
-
-    # --------------------------------------------------------
-    # YooMoney label
-    # --------------------------------------------------------
-
-    labels_list = parsed_data.get(
-        "label",
-        []
-    )
-
-    incoming_label = (
-        labels_list[0]
-        if labels_list
-        else None
-    )
-
-
-    # --------------------------------------------------------
-    # YooMoney amount
-    # --------------------------------------------------------
-
-    amounts_list = parsed_data.get(
-        "withdraw_amount",
-        ["0"]
-    )
-
-    withdraw_amount = (
-        amounts_list[0]
-        if amounts_list
-        else "0"
-    )
-
-
-    # --------------------------------------------------------
-    # Проверяем order_id
-    # --------------------------------------------------------
-
-    if not incoming_label:
-
-        print(
-            "⚠️ Получен webhook без label",
-            flush=True
-        )
-
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "no_label"
-            }
-        )
-
-
-    # --------------------------------------------------------
-    # Проверяем существующий заказ
-    # --------------------------------------------------------
-
-    if incoming_label not in DONATIONS_DB:
-
-        print(
-            "⚠️ Получен webhook для "
-            f"неизвестного заказа: {incoming_label}",
-            flush=True
-        )
-
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "unknown_order"
-            }
-        )
-
-
-    order = DONATIONS_DB[
-        incoming_label
-    ]
-
-
-    # --------------------------------------------------------
-    # Защита от повторного webhook
-    # --------------------------------------------------------
-
-    if (
-        order["status"] == "success"
-        or incoming_label in PROCESSED_ORDERS
-    ):
-
-        print(
-            f"ℹ️ Повторный webhook: "
-            f"{incoming_label}",
-            flush=True
-        )
-
-        return {
-            "status": "already_processed"
-        }
-
-
-    # --------------------------------------------------------
-    # Данные заказа
-    # --------------------------------------------------------
-
-    user = order["username"]
-
-    msg = order["message"]
-
+    body = await request.body()
 
     try:
 
-        paid_amount = Decimal(
-            str(withdraw_amount)
+        form_data = parse_qs(
+            body.decode("utf-8")
         )
 
-    except (InvalidOperation, ValueError):
+        label = form_data.get(
+            "label",
+            [None]
+        )[0]
 
-        print(
-            f"❌ Некорректная сумма YooMoney: "
-            f"{withdraw_amount}",
-            flush=True
-        )
+        withdraw_amount = form_data.get(
+            "withdraw_amount",
+            ["0"]
+        )[0]
 
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "bad_amount"
+        if not label:
+
+            return {
+                "status": "error",
+                "message": "label отсутствует"
             }
-        )
 
 
-    if paid_amount <= 0:
+        # ----------------------------------------------------
+        # Проверяем заказ
+        # ----------------------------------------------------
 
-        print(
-            f"❌ Некорректная сумма: "
-            f"{paid_amount}",
-            flush=True
-        )
+        order = DONATIONS_DB.get(label)
 
-        return JSONResponse(
-            status_code=400,
-            content={
-                "status": "bad_amount"
+        if not order:
+
+            print(
+                f"❌ Заказ не найден: {label}"
+            )
+
+            return {
+                "status": "error",
+                "message": "order not found"
             }
-        )
 
 
-    print(
-        "\n🎉 ПОЛУЧЕН ПЛАТЁЖ",
-        flush=True
-    )
+        # ----------------------------------------------------
+        # Защита от повторного webhook
+        # ----------------------------------------------------
 
-    print(
-        f"Order ID: {incoming_label}",
-        flush=True
-    )
+        if (
+            label in PROCESSED_ORDERS
+            or order.get("status") == "success"
+        ):
 
-    print(
-        f"User: {user}",
-        flush=True
-    )
+            print(
+                f"⚠️ Повторный webhook: {label}"
+            )
 
-    print(
-        f"Amount: {paid_amount} RUB",
-        flush=True
-    )
-
-    print(
-        f"Message: {msg}",
-        flush=True
-    )
-
-
-    # ========================================================
-    # 1. UPDATE DEPOSIT
-    # ========================================================
-
-    deposit_success, new_balance = (
-        add_to_deposit(
-            username=user,
-            amount=paid_amount
-        )
-    )
-
-
-    if not deposit_success:
-
-        print(
-            "❌ Депозит НЕ обновлён. "
-            "Excel тоже пока НЕ пишем.",
-            flush=True
-        )
-
-        # Возвращаем ошибку, чтобы YooMoney мог
-        # повторить webhook.
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "deposit_update_failed"
+            return {
+                "status": "already_processed"
             }
+
+
+        amount = float(withdraw_amount)
+
+        username = order["username"]
+        message = order["message"]
+
+
+        # ----------------------------------------------------
+        # ПОПОЛНЯЕМ DEPOSIT
+        # ----------------------------------------------------
+
+        success, balance_or_error = add_to_deposit(
+            username=username,
+            amount=amount
+        )
+
+        if not success:
+
+            print(
+                f"❌ Не удалось пополнить депозит: "
+                f"{balance_or_error}"
+            )
+
+            return {
+                "status": "error",
+                "message": balance_or_error
+            }
+
+
+        # ----------------------------------------------------
+        # Пишем платеж в Google Sheets
+        # ----------------------------------------------------
+
+        write_to_google_sheet(
+            order_id=label,
+            username=username,
+            amount=amount,
+            message=message,
+            status="success"
         )
 
 
-    # ========================================================
-    # 2. GOOGLE SHEETS LOG
-    # ========================================================
+        # ----------------------------------------------------
+        # Отмечаем заказ обработанным
+        # ----------------------------------------------------
 
-    sheet_success = write_to_google_sheet(
+        order["status"] = "success"
+        order["paid_amount"] = amount
+        order["balance"] = balance_or_error
 
-        order_id=incoming_label,
+        PROCESSED_ORDERS.add(label)
 
-        username=user,
-
-        amount=str(paid_amount),
-
-        message=msg,
-
-        status="paid"
-    )
-
-
-    if not sheet_success:
 
         print(
-            "⚠️ Депозит уже обновлён, "
-            "но запись в Google Sheets не удалась.",
-            flush=True
-        )
-
-    else:
-
-        print(
-            "✅ Лог платежа записан в Excel/Google Sheets",
-            flush=True
+            f"✅ Платеж обработан: "
+            f"{username} +{amount}; "
+            f"баланс = {balance_or_error}"
         )
 
 
-    # ========================================================
-    # 3. MARK ORDER AS PROCESSED
-    # ========================================================
+        return {
+            "status": "success",
+            "order_id": label,
+            "username": username,
+            "amount": amount,
+            "balance": balance_or_error
+        }
 
-    order["status"] = "success"
+    except Exception as e:
 
-    order["amount"] = str(
-        paid_amount
-    )
+        print(f"❌ Webhook error: {e}")
 
-    order["balance"] = new_balance
-
-    PROCESSED_ORDERS.add(
-        incoming_label
-    )
-
-
-    print(
-        f"✅ ВСЁ ГОТОВО: "
-        f"{user} получил +{paid_amount} "
-        f"депозита. Новый баланс: {new_balance}",
-        flush=True
-    )
-
-    print(
-        "=" * 50,
-        flush=True
-    )
-
-
-    return {
-        "status": "ok",
-
-        "order_id":
-            incoming_label,
-
-        "username":
-            user,
-
-        "amount":
-            str(paid_amount),
-
-        "balance":
-            new_balance,
-
-        "sheet_logged":
-            sheet_success
-    }
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 
 # ============================================================
 # CHECK STATUS
 # ============================================================
 
-@app.get("/check-status")
-async def check_status(
-    order_id: str = None
-):
+@app.get("/check-status/{order_id}")
+async def check_status(order_id: str):
 
-    if not order_id:
+    order = DONATIONS_DB.get(order_id)
 
-        return {
-            "status": "pending"
-        }
-
-
-    if (
-        order_id in DONATIONS_DB
-        and
-        DONATIONS_DB[order_id]["status"]
-        == "success"
-    ):
+    if not order:
 
         return {
-            "status": "paid"
+            "status": "not_found"
         }
-
 
     return {
-        "status": "pending"
+        "status": order.get("status"),
+        "order_id": order_id,
+        "username": order.get("username"),
+        "amount": order.get("amount"),
+        "paid_amount": order.get("paid_amount"),
+        "balance": order.get("balance")
     }
 
 
@@ -1019,61 +660,36 @@ async def check_status(
 @app.get("/get-donations")
 async def get_donations():
 
-    paid_donations = []
+    result = []
 
+    for order_id, donation in DONATIONS_DB.items():
 
-    for order_id, info in DONATIONS_DB.items():
+        if donation.get("status") == "success":
 
-        if info["status"] == "success":
-
-            paid_donations.append({
-
-                "id":
-                    order_id,
-
-                "username":
-                    info["username"],
-
-                "message":
-                    info["message"],
-
-                "amount":
-                    info["amount"]
+            result.append({
+                "order_id": order_id,
+                "username": donation.get("username"),
+                "amount": donation.get("paid_amount"),
+                "message": donation.get("message"),
+                "balance": donation.get("balance")
             })
 
-
-    # ========================================================
-    # ВАЖНО:
-    #
-    # НИКАКОГО:
-    #
-    # del DONATIONS_DB[order_id]
-    #
-    # Здесь больше нет.
-    #
-    # GET только читает данные.
-    # ========================================================
-
-    return JSONResponse(
-        content=paid_donations
-    )
+    return result
 
 
 # ============================================================
-# START
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            8000
-        )
-    )
-
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=port
+        port=int(
+            os.getenv(
+                "PORT",
+                8000
+            )
+        )
     )
