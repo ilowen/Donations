@@ -8,9 +8,17 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from yoomoney import Quickpay
-from google.oauth2.service_account import Credentials
-import gspread
 import uvicorn
+
+
+# Supabase configuration
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+supabase_client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    from supabase import create_client
+    supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 
 app = FastAPI()
 
@@ -35,8 +43,12 @@ class DonationOrder(BaseModel):
     message: str
     amount: int
 
-# Функция отправки доната в Google Таблицу (читает файл из Secret Files)
+
+# Функция записи в Google Таблицу (резервная)
 def write_to_google_sheet(username, amount, message):
+    """
+    Записывает запись в Google Sheets (используется только если Supabase недоступен).
+    """
     secret_file_path = "learned-pact-242010-54a8a1daf93f.json"
     
     if not GOOGLE_SHEET_ID:
@@ -68,8 +80,30 @@ def write_to_google_sheet(username, amount, message):
         print("📊 Строка успешно записана в Google Таблицу через Secret File!", flush=True)
     except Exception as e:
         print(f"❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПИСИ В GOOGLE ТАБЛИЦУ: {e}", flush=True)
+
+
+# Новая функция для вставки в Supabase
+def insert_into_supabase(order_id, username, message, amount):
+    """
+    Вставляет запись о заполнении депозита в Supabase.
+    """
+    if not supabase_client:
+        print("⚠️ Supabase не настроен - не можем записать в базу", flush=True)
+        return
+    
+    try:
+        query = """
+        INSERT INTO donations (id, username, message, amount, created_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        """
+        supabase_client.query(query, [order_id, username, message, amount])
+        print(f"✅ Запись успешно вставлена в Supabase (ID: {order_id})", flush=True)
+    except Exception as e:
+        print(f"❌ Ошибка при вставке в Supabase: {e}", flush=True)
+
+
 # =====================================================================
-# 1. UI ФРОНТЕНД (GET /) - Форма отправляет fetch и ждет ответа бэкенда
+# 1. UI ФРОНТЕНД (GET /) - Форма отправляет fetch и ждет ответ бэкенда
 # =====================================================================
 @app.get("/", response_class=HTMLResponse)
 async def home_page():
@@ -146,6 +180,7 @@ async def home_page():
     </html>
     """
 
+
 # =====================================================================
 # 2. ГЕНЕРАТОР ЗАКАЗОВ (POST /create-order)
 # =====================================================================
@@ -171,6 +206,7 @@ async def create_order(order: DonationOrder):
     
     return JSONResponse(content={"url": quickpay.redirected_url, "order_id": order_id})
 
+
 # =====================================================================
 # 3. ЛОВУШКА ХУКОВ НА ЧИСТЫХ БАЙТАХ (POST /webhook)
 # =====================================================================
@@ -190,7 +226,7 @@ async def handle_yoomoney_webhook(request: Request):
     if not incoming_label:
         print("⚠️ Получен вебхук без поля label", flush=True)
         return {"status": "no_label"}
-
+    
     if incoming_label in DONATIONS_DB:
         DONATIONS_DB[incoming_label]["status"] = "success"
         DONATIONS_DB[incoming_label]["amount"] = withdraw_amount
@@ -198,17 +234,18 @@ async def handle_yoomoney_webhook(request: Request):
         user = DONATIONS_DB[incoming_label]["username"]
         msg = DONATIONS_DB[incoming_label]["message"]
 
-        print(f"\\n🎉 ТРУ-АЛЬФА ХУК ОБРАБОТАН НА БАЙТАХ!", flush=True)
+        print(f"\n🎉 ТРУ-АЛЬФА ХУК ОБРАБОТАН НА БАЙТАХ!", flush=True)
         print(f"ID заказа: {incoming_label} | От кого: {user} | Сумма: {withdraw_amount} руб.", flush=True)
         print(f"Сообщение: {msg}", flush=True)
         print("=" * 40, flush=True)
         
-        # Пишем в Google Таблицу через секретный файл
-        write_to_google_sheet(user, withdraw_amount, msg)
+        # Записываем в Supabase вместо Google Sheets
+        insert_into_supabase(incoming_label, user, msg, withdraw_amount)
     else:
         print(f"⚠️ Получен вебхук для неизвестного ID заказа: {incoming_label}", flush=True)
         
     return {"status": "ok"}
+
 
 # =====================================================================
 # 4. ПРОВЕРКА СТАТУСА ДЛЯ UI (GET /check-status)
@@ -220,6 +257,7 @@ async def check_status(order_id: str = None):
     if order_id in DONATIONS_DB and DONATIONS_DB[order_id]["status"] == "success":
         return {"status": "paid"}
     return {"status": "pending"}
+
 
 # =====================================================================
 # 5. РУЧКА ДЛЯ OBS (GET /get-donations)
@@ -237,6 +275,7 @@ async def get_donations():
             })
             del DONATIONS_DB[order_id]
     return JSONResponse(content=paid_donations)
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
