@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import datetime
 import hmac
@@ -46,6 +47,14 @@ GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 
 DONATIONS_DB = {}
 PROCESSED_ORDERS = set()
+
+
+def normalize_username(username: str) -> str:
+    """Нормализует юзернейм: удаляет все пробелы и приводит к нижнему регистру."""
+    if not username:
+        return "аноним"
+    return re.sub(r"\s+", "", username).lower()
+
 
 class DonationOrder(BaseModel):
     username: str
@@ -121,11 +130,13 @@ def add_to_deposit(username, amount):
     if not supabase_client:
         return False, "Supabase не настроен"
 
+    clean_username = normalize_username(username)
+
     try:
         result = (
             supabase_client.table(DEPOSITS_TABLE)
             .select(DEPOSIT_BALANCE_COLUMN)
-            .eq(DEPOSIT_USER_COLUMN, username)
+            .eq(DEPOSIT_USER_COLUMN, clean_username)
             .limit(1)
             .execute()
         )
@@ -136,7 +147,7 @@ def add_to_deposit(username, amount):
             insert_result = (
                 supabase_client.table(DEPOSITS_TABLE)
                 .insert({
-                    DEPOSIT_USER_COLUMN: username,
+                    DEPOSIT_USER_COLUMN: clean_username,
                     DEPOSIT_BALANCE_COLUMN: initial_balance,
                     DEPOSIT_UPDATED_COLUMN: datetime.datetime.now(
                         datetime.timezone.utc
@@ -146,13 +157,13 @@ def add_to_deposit(username, amount):
             )
 
             if not insert_result.data:
-                return False, f"Не удалось создать пользователя '{username}' в {DEPOSITS_TABLE}"
+                return False, f"Не удалось создать пользователя '{clean_username}' в {DEPOSITS_TABLE}"
 
             saved_balance = float(
                 insert_result.data[0].get(DEPOSIT_BALANCE_COLUMN, initial_balance)
             )
             print(
-                f"✅ DEPOSIT CREATE: {username}: 0 + {amount} = {saved_balance}",
+                f"✅ DEPOSIT CREATE: {clean_username}: 0 + {amount} = {saved_balance}",
                 flush=True,
             )
             return True, saved_balance
@@ -166,12 +177,12 @@ def add_to_deposit(username, amount):
             DEPOSIT_UPDATED_COLUMN: datetime.datetime.now(
                 datetime.timezone.utc
             ).isoformat(),
-        }).eq(DEPOSIT_USER_COLUMN, username).execute()
+        }).eq(DEPOSIT_USER_COLUMN, clean_username).execute()
 
         verify = (
             supabase_client.table(DEPOSITS_TABLE)
             .select(DEPOSIT_BALANCE_COLUMN)
-            .eq(DEPOSIT_USER_COLUMN, username)
+            .eq(DEPOSIT_USER_COLUMN, clean_username)
             .limit(1)
             .execute()
         )
@@ -180,7 +191,7 @@ def add_to_deposit(username, amount):
 
         saved_balance = float(verify.data[0].get(DEPOSIT_BALANCE_COLUMN) or 0)
         print(
-            f"✅ DEPOSIT UPDATE: {username}: {current_balance} + {amount} = {saved_balance}",
+            f"✅ DEPOSIT UPDATE: {clean_username}: {current_balance} + {amount} = {saved_balance}",
             flush=True,
         )
         return True, saved_balance
@@ -264,8 +275,9 @@ async def home_page():
 @app.post("/create-order")
 async def create_order(order: DonationOrder):
     order_id = f"ord_{uuid.uuid4().hex[:12]}"
+    clean_username = normalize_username(order.username)
     DONATIONS_DB[order_id] = {
-        "username": order.username,
+        "username": clean_username,
         "message": order.message,
         "amount": order.amount,
         "status": "pending",
@@ -333,7 +345,7 @@ async def handle_yoomoney_webhook(request: Request):
     if amount <= 0:
         return {"status": "bad_amount"}
 
-    user = DONATIONS_DB[incoming_label]["username"]
+    user = normalize_username(DONATIONS_DB[incoming_label]["username"])
     msg = DONATIONS_DB[incoming_label]["message"]
 
     print(
