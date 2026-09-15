@@ -1,20 +1,21 @@
+import datetime
+import hashlib
+import hmac
+import math
 import os
 import re
 import uuid
-import datetime
-import hmac
-import hashlib
 from urllib.parse import parse_qs, quote
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from yoomoney import Quickpay
-from supabase import create_client, Client
-import gspread
+from fastapi.responses import HTMLResponse, JSONResponse
 from google.oauth2.service_account import Credentials
+import gspread
+from pydantic import BaseModel
+from supabase import Client, create_client
 import uvicorn
+from yoomoney import Quickpay
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -113,11 +114,15 @@ def write_to_google_sheet(username, amount, message, order_id=None):
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
-        creds = Credentials.from_service_account_file(secret_file_path, scopes=scopes)
+        creds = Credentials.from_service_account_file(
+            secret_file_path, scopes=scopes
+        )
         client = gspread.authorize(creds)
         sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        sheet.append_row([current_time, username, amount, message, order_id or ""])
+        sheet.append_row(
+            [current_time, username, amount, message, order_id or ""]
+        )
         print("📊 Строка успешно записана в Google Таблицу!", flush=True)
         return True
     except Exception as e:
@@ -157,10 +162,15 @@ def add_to_deposit(username, amount):
             )
 
             if not insert_result.data:
-                return False, f"Не удалось создать пользователя '{clean_username}' в {DEPOSITS_TABLE}"
+                return (
+                    False,
+                    f"Не удалось создать пользователя '{clean_username}' в {DEPOSITS_TABLE}",
+                )
 
             saved_balance = float(
-                insert_result.data[0].get(DEPOSIT_BALANCE_COLUMN, initial_balance)
+                insert_result.data[0].get(
+                    DEPOSIT_BALANCE_COLUMN, initial_balance
+                )
             )
             print(
                 f"✅ DEPOSIT CREATE: {clean_username}: 0 + {amount} = {saved_balance}",
@@ -169,7 +179,9 @@ def add_to_deposit(username, amount):
             return True, saved_balance
 
         # СУЩЕСТВУЮЩИЙ ПОЛЬЗОВАТЕЛЬ: увеличиваем баланс.
-        current_balance = float(result.data[0].get(DEPOSIT_BALANCE_COLUMN) or 0)
+        current_balance = float(
+            result.data[0].get(DEPOSIT_BALANCE_COLUMN) or 0
+        )
         new_balance = current_balance + float(amount)
 
         supabase_client.table(DEPOSITS_TABLE).update({
@@ -314,9 +326,10 @@ async def handle_yoomoney_webhook(request: Request):
 
     incoming_label = parsed_data.get("label", [""])[0]
 
-    # ВНИМАНИЕ: amount — сумма операции, поступившая получателю.
-    # Здесь намеренно НЕТ проверки against order amount.
-    amount_raw = parsed_data.get("amount", ["0"])[0]
+    # Берём withdraw_amount (сколько списано у клиента) или amount (что пришло на кошелёк)
+    amount_raw = parsed_data.get(
+        "withdraw_amount", parsed_data.get("amount", ["0"])
+    )[0]
 
     if not incoming_label:
         print("⚠️ Получен вебхук без поля label", flush=True)
@@ -337,7 +350,8 @@ async def handle_yoomoney_webhook(request: Request):
         return {"status": "ok", "already_processed": True}
 
     try:
-        amount = float(amount_raw)
+        # Округляем в большую сторону до целого числа (например: 98.02 -> 99, 99.50 -> 100)
+        amount = int(math.ceil(float(amount_raw)))
     except (TypeError, ValueError):
         print(f"❌ Некорректная сумма в webhook: {amount_raw}", flush=True)
         return {"status": "bad_amount"}
@@ -349,7 +363,7 @@ async def handle_yoomoney_webhook(request: Request):
     msg = DONATIONS_DB[incoming_label]["message"]
 
     print(
-        f"\n🎉 ПЛАТЁЖ: {incoming_label} | {user} | {amount} руб.",
+        f"\n🎉 ПЛАТЁЖ: {incoming_label} | {user} | {amount} руб. (округлено с {amount_raw})",
         flush=True,
     )
 
