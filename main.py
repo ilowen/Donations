@@ -64,8 +64,6 @@ class DonationOrder(BaseModel):
 
 
 def verify_yoomoney_sign(parsed_data: dict) -> bool:
-    """Проверка sign по алгоритму YooMoney: все POST-параметры кроме sign,
-    сортировка по имени, RFC3986 URL encoding, HMAC-SHA256, HEX."""
     if not YOOMONEY_SECRET:
         print("❌ YOOMONEY_SECRET не настроен", flush=True)
         return False
@@ -99,14 +97,9 @@ def verify_yoomoney_sign(parsed_data: dict) -> bool:
 
 
 def write_to_google_sheet(username, amount, message, order_id=None):
-    """Добавляет строку о пополнении в первый лист Google Sheets."""
     secret_file_path = "learned-pact-242010-54a8a1daf93f.json"
 
-    if not GOOGLE_SHEET_ID:
-        print("⚠️ GOOGLE_SHEET_ID не настроен", flush=True)
-        return False
-    if not os.path.exists(secret_file_path):
-        print(f"⚠️ Секретный файл {secret_file_path} не найден", flush=True)
+    if not GOOGLE_SHEET_ID or not os.path.exists(secret_file_path):
         return False
 
     try:
@@ -131,7 +124,6 @@ def write_to_google_sheet(username, amount, message, order_id=None):
 
 
 def add_to_deposit(username, amount):
-    """Если пользователя нет — создаёт строку. Если есть — увеличивает balance."""
     if not supabase_client:
         return False, "Supabase не настроен"
 
@@ -146,7 +138,6 @@ def add_to_deposit(username, amount):
             .execute()
         )
 
-        # НОВЫЙ ПОЛЬЗОВАТЕЛЬ: создаём депозит с первой суммой.
         if not result.data:
             initial_balance = float(amount)
             insert_result = (
@@ -164,7 +155,7 @@ def add_to_deposit(username, amount):
             if not insert_result.data:
                 return (
                     False,
-                    f"Не удалось создать пользователя '{clean_username}' в {DEPOSITS_TABLE}",
+                    f"Не удалось создать пользователя '{clean_username}'",
                 )
 
             saved_balance = float(
@@ -172,13 +163,8 @@ def add_to_deposit(username, amount):
                     DEPOSIT_BALANCE_COLUMN, initial_balance
                 )
             )
-            print(
-                f"✅ DEPOSIT CREATE: {clean_username}: 0 + {amount} = {saved_balance}",
-                flush=True,
-            )
             return True, saved_balance
 
-        # СУЩЕСТВУЮЩИЙ ПОЛЬЗОВАТЕЛЬ: увеличиваем баланс.
         current_balance = float(
             result.data[0].get(DEPOSIT_BALANCE_COLUMN) or 0
         )
@@ -198,18 +184,11 @@ def add_to_deposit(username, amount):
             .limit(1)
             .execute()
         )
-        if not verify.data:
-            return False, "Не удалось проверить UPDATE deposits"
-
         saved_balance = float(verify.data[0].get(DEPOSIT_BALANCE_COLUMN) or 0)
-        print(
-            f"✅ DEPOSIT UPDATE: {clean_username}: {current_balance} + {amount} = {saved_balance}",
-            flush=True,
-        )
         return True, saved_balance
 
     except Exception as e:
-        print(f"❌ Ошибка INSERT/UPDATE deposits: {e}", flush=True)
+        print(f"❌ Ошибка deposits: {e}", flush=True)
         return False, str(e)
 
 
@@ -219,12 +198,14 @@ async def home_page():
     <html>
     <head>
         <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>YooMoney True Order Donat</title>
         <style>
-            body { font-family: Arial, sans-serif; max-width: 400px; margin: 50px auto; padding: 20px; background: #f4f4f9; text-align: center; }
-            .card { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-            input, textarea, button { width: 100%; padding: 12px; margin: 8px 0; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }
-            button { background: #8a2be2; color: white; font-weight: bold; cursor: pointer; border: none; font-size: 16px; }
+            body { font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif; max-width: 400px; margin: 20px auto; padding: 20px; background: #f4f4f9; text-align: center; }
+            .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.08); }
+            input, textarea, button { width: 100%; padding: 12px; margin: 8px 0; border: 1px solid #ccc; border-radius: 8px; box-sizing: border-box; font-size: 16px; -webkit-appearance: none; }
+            button { background: #8a2be2; color: white; font-weight: bold; cursor: pointer; border: none; }
+            button:disabled { background: #aaa; }
             textarea { resize: none; height: 80px; }
         </style>
     </head>
@@ -237,20 +218,30 @@ async def home_page():
                 <input type="number" id="amount" placeholder="Сумма (руб)" min="2" value="100" required>
                 <button type="submit" id="submitBtn">Поддержать</button>
             </form>
-            <p id="status" style="color: gray; font-size: 11px; margin-top: 15px;">Донат-сервер: СТАТУС АКТИВЕН 🟢</p>
+            <p id="status" style="color: gray; font-size: 12px; margin-top: 15px;">Донат-сервер: СТАТУС АКТИВЕН 🟢</p>
         </div>
         <script>
             async function sendDonationRequest(event) {
                 event.preventDefault();
                 const submitBtn = document.getElementById('submitBtn');
                 const status = document.getElementById('status');
+                
                 submitBtn.innerText = "Создание заказа...";
                 submitBtn.disabled = true;
+
+                // Для iOS Safari: открываем вкладку СРАЗУ по клику пользователя, пока синхронно
+                const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+                let payWindow = null;
+                if (!isMobile) {
+                    payWindow = window.open('about:blank', '_blank');
+                }
+
                 const payload = {
                     username: document.getElementById('username').value.trim() || 'Аноним',
                     message: document.getElementById('message').value.trim() || 'Без сообщения',
                     amount: parseInt(document.getElementById('amount').value) || 100
                 };
+
                 try {
                     const response = await fetch('/create-order', {
                         method: 'POST',
@@ -258,8 +249,18 @@ async def home_page():
                         body: JSON.stringify(payload)
                     });
                     const data = await response.json();
+
                     if (data.url && data.order_id) {
-                        window.open(data.url, '_blank');
+                        if (isMobile) {
+                            // На Айфонах надежнее переходить в этой же вкладке
+                            window.location.href = data.url;
+                            return;
+                        } else if (payWindow) {
+                            payWindow.location.href = data.url;
+                        } else {
+                            window.location.href = data.url;
+                        }
+
                         submitBtn.innerText = "Ожидание оплаты...";
                         const interval = setInterval(async () => {
                             const statusResp = await fetch(`/check-status?order_id=${data.order_id}`);
@@ -271,10 +272,14 @@ async def home_page():
                                 status.innerText = "Депозит пополнен.";
                             }
                         }, 3000);
+                    } else {
+                        if (payWindow) payWindow.close();
+                        throw new Error("Не удалось получить ссылку");
                     }
                 } catch (err) {
                     console.error(err);
-                    submitBtn.innerText = "Поддержать";
+                    if (payWindow) payWindow.close();
+                    submitBtn.innerText = "Ошибка. Попробовать снова";
                     submitBtn.disabled = false;
                 }
             }
@@ -315,45 +320,26 @@ async def handle_yoomoney_webhook(request: Request):
     body_str = body_bytes.decode("utf-8")
     parsed_data = parse_qs(body_str, keep_blank_values=True)
 
-    print(f"📩 YooMoney webhook: {parsed_data}", flush=True)
-
-    # Подлинность webhook проверяем по sign.
     if not verify_yoomoney_sign(parsed_data):
         return JSONResponse(
-            status_code=403,
-            content={"status": "invalid_signature"},
+            status_code=403, content={"status": "invalid_signature"}
         )
 
     incoming_label = parsed_data.get("label", [""])[0]
-
-    # Берём withdraw_amount (сколько списано у клиента) или amount (что пришло на кошелёк)
     amount_raw = parsed_data.get(
         "withdraw_amount", parsed_data.get("amount", ["0"])
     )[0]
 
-    if not incoming_label:
-        print("⚠️ Получен вебхук без поля label", flush=True)
-        return {"status": "no_label"}
-
-    if incoming_label not in DONATIONS_DB:
-        print(
-            f"⚠️ Получен вебхук для неизвестного ID заказа: {incoming_label}",
-            flush=True,
-        )
+    if (
+        not incoming_label
+        or incoming_label not in DONATIONS_DB
+        or incoming_label in PROCESSED_ORDERS
+    ):
         return {"status": "ok"}
 
-    if incoming_label in PROCESSED_ORDERS:
-        print(
-            f"⚠️ Повторный webhook для уже обработанного заказа: {incoming_label}",
-            flush=True,
-        )
-        return {"status": "ok", "already_processed": True}
-
     try:
-        # Округляем в большую сторону до целого числа (например: 98.02 -> 99, 99.50 -> 100)
         amount = int(math.ceil(float(amount_raw)))
     except (TypeError, ValueError):
-        print(f"❌ Некорректная сумма в webhook: {amount_raw}", flush=True)
         return {"status": "bad_amount"}
 
     if amount <= 0:
@@ -362,53 +348,25 @@ async def handle_yoomoney_webhook(request: Request):
     user = normalize_username(DONATIONS_DB[incoming_label]["username"])
     msg = DONATIONS_DB[incoming_label]["message"]
 
-    print(
-        f"\n🎉 ПЛАТЁЖ: {incoming_label} | {user} | {amount} руб. (округлено с {amount_raw})",
-        flush=True,
-    )
-
-    # Сначала депозит.
     success, result = add_to_deposit(user, amount)
     if not success:
-        print(f"❌ Депозит НЕ пополнен: {result}", flush=True)
-        return {
-            "status": "deposit_update_error",
-            "message": result,
-        }
+        return {"status": "deposit_update_error", "message": result}
 
-    # После успешного депозита — запись в Excel/Google Sheets.
-    write_to_google_sheet(
-        user,
-        amount,
-        msg,
-        incoming_label,
-    )
+    write_to_google_sheet(user, amount, msg, incoming_label)
 
     DONATIONS_DB[incoming_label]["status"] = "success"
     DONATIONS_DB[incoming_label]["amount"] = amount
     DONATIONS_DB[incoming_label]["balance"] = result
     PROCESSED_ORDERS.add(incoming_label)
 
-    print(
-        f"✅ Платеж зачислен: {user} + {amount} руб. | Новый баланс: {result}",
-        flush=True,
-    )
-
-    return {
-        "status": "ok",
-        "order_id": incoming_label,
-        "username": user,
-        "amount": amount,
-        "balance": result,
-    }
+    return {"status": "ok"}
 
 
 @app.get("/check-status")
 async def check_status(order_id: str = None):
-    if not order_id:
-        return {"status": "pending"}
     if (
-        order_id in DONATIONS_DB
+        order_id
+        and order_id in DONATIONS_DB
         and DONATIONS_DB[order_id]["status"] == "success"
     ):
         return {"status": "paid"}
